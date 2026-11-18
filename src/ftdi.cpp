@@ -95,7 +95,7 @@ public:
 	}
 
 	void reset() const throw(error_t) {
-	  write_cv(0, 0, ifcnum);
+	  write_cv(0, 0, isH ? ifcnum + 1 : ifcnum);
 	}
 
 	void setbaudrate(baudrate_t baudrate) const throw(error_t) {
@@ -103,13 +103,13 @@ public:
 		uint16_t value;
 		compute_divisors(baudrate, value, index);
 		log.i(__,"baudrate=%d, i=%#04X v=%#04X", baudrate, index, value);
-		write_cv(set_baudrate_req, value, index | ifcnum);
+		write_cv(set_baudrate_req, value, index | (isH ? ifcnum + 1 : ifcnum));
 	}
 
 	void setup(const eia_tia_232_info& info) const throw(error_t) {
+		reset();
 		setbaudrate(info.baudrate);
 		setlineprops(info);
-		reset();
 		generic::setup(info);
 	}
 protected:
@@ -117,14 +117,17 @@ protected:
 	uint8_t errors;
 private:
 	inline ftdi(libusb_device_handle* d, uint8_t num, bool ish) throw(error_t)
-	  : generic(d, ish?h_ifcs[num]:l_ifc, num), isH(ish) {}
+	  : generic(d, ish?h_ifcs[num]:l_ifc, num), isH(ish), errors(0) {}
 	void setlineprops(const eia_tia_232_info& info) const throw(error_t) {
 		uint16_t value =
 				info.databits					|
 				(((uint16_t)info.parity)<<8) 	|
 				(((uint16_t)info.stopbits)<<11);
-		write_cv(set_data_req, value, ifcnum);
-		write_cv(set_flowcontrol_req, info.flowcontrol, ifcnum);
+		const uint16_t index = isH ? ifcnum + 1 : ifcnum;
+		write_cv(set_data_req, value, index);
+		const uint16_t handshake = info.flowcontrol == xon_xoff ? 0x0400 :
+			static_cast<uint16_t>(info.flowcontrol) << 8;
+		write_cv(set_flowcontrol_req, info.flowcontrol == xon_xoff ? 0x1311 : 0, index | handshake);
 	}
 	static class factory : driver::factory {
 		driver* create(libusb_device_handle*, uint8_t) const throw(error_t);
@@ -204,6 +207,6 @@ driver* ftdi::factory::create(libusb_device_handle* handle, uint8_t num) const t
 	//        return packet_size;
 
 	//TODO actually probe and init driver here
-	return new ftdi(handle, ish, num);
+	return new ftdi(handle, num, ish);
 }
 } /* namespace usbuart */

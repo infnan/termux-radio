@@ -1,0 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' '缺少 Python：请先执行 pkg install python' >&2
+    exit 1
+fi
+if [[ -f "$script_dir/radio_usb.py" ]]; then
+    exec python3 "$script_dir/radio_usb.py" "$@"
+fi
+exec python3 "${PREFIX:-/data/data/com.termux/files/usr}/libexec/termux-radio/radio_usb.py" "$@"

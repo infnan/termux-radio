@@ -1,152 +1,42 @@
-# Makefile - make script to build USBUART Library
-#
-# Copyright (C) 2016 Eugene Hutorny <eugene@hutorny.in.ua>
-#
-# This file is part of USBUART Library. http://usbuart.info
-#
-# The USBUART Library is free software; you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License v2
-# as published by the Free Software Foundation;
-#
-# The USBUART Library is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-# See the GNU Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with the USBUART Library; if not, see
-# <http://www.gnu.org/licenses/gpl-2.0.html>.
-
-# This makefile builds unit tests for cojson
-# It is not intended to build any other applications
-
-MAKEFLAGS += --no-builtin-rules
+PREFIX ?= /usr/local
+CXX := $(if $(wildcard $(PREFIX)/bin/clang++),$(PREFIX)/bin/clang++,c++)
+BUILD-DIR ?= build
 TARGET-DIR := bin
-BUILD-DIR ?= ~/usbuart-termux
-BOLD:=$(shell tput bold)
-NORM:=$(shell tput sgr0)
+CPPFLAGS += -Iinclude -Isrc $(shell pkg-config --cflags libusb-1.0)
+CXXFLAGS ?= -O2 -g
+CXXFLAGS += -std=c++14 -Wall -Wextra -fPIC -MMD -MP
+USB_LIBS := $(shell pkg-config --libs libusb-1.0)
+PTY_LIBS := $(if $(filter Android,$(shell uname -o 2>/dev/null)),,-lutil)
+SOURCES := capi ch34x core cp210x ftdi generic log pl2303
+OBJECTS := $(addprefix $(BUILD-DIR)/,$(addsuffix .o,$(SOURCES)))
 
-CC  := $(if $(V),,@)$(PREFIX)/bin/clang$(SUFFIX)
-CXX := $(if $(V),,@)$(PREFIX)/bin/clang++$(SUFFIX)
-LD  := $(if $(V),,@)$(PREFIX)/bin/clang++$(SUFFIX)
+.PHONY: all clean install
+all: $(TARGET-DIR)/libusbuart.so radio-bridge
 
-MAKEFLAGS += --no-builtin-rules
+$(BUILD-DIR) $(TARGET-DIR):
+	mkdir -p $@
 
-SRC-DIRS := src
+$(BUILD-DIR)/%.o: src/%.cpp | $(BUILD-DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-INCLUDES := include libusb/libusb # Removed $(PREFIX)/include/libusb-1.0
+$(BUILD-DIR)/%.o: examples/%.cpp | $(BUILD-DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-.PHONY: all
+$(TARGET-DIR)/libusbuart.so: $(OBJECTS) | $(TARGET-DIR)
+	$(CXX) $(LDFLAGS) -shared -Wl,-soname,libusbuart.so -o $@ $^ $(USB_LIBS)
 
-.DEFAULT:
+ptyserial uartcat radio-bridge: %: $(BUILD-DIR)/%.o $(TARGET-DIR)/libusbuart.so
+	$(CXX) $(LDFLAGS) -o $@ $< -L$(TARGET-DIR) -Wl,-rpath,'$$ORIGIN/bin:$$ORIGIN/../lib' -lusbuart $(USB_LIBS) $(PTY_LIBS)
 
-all : $(TARGET-DIR)/libusbuart.so
-
-Makefile :: ;
-
-%.mk :: ;
-
-OBJS :=																		\
-  capi.o 																	\
-  ch34x.o																	\
-  core.o																	\
-  ftdi.o																	\
-  generic.o																	\
-  log.o																		\
-  pl2303.o																	\
-
-
-CPPFLAGS += 																\
-  $(addprefix -I,$(INCLUDES))												\
-  $(shell pkg-config --cflags libusb-1.0)                                   \
-  $(addprefix -D,$(CXX-DEFS))												\
-  $(if $(V),-v,)															\
-  -Wall																		\
-  -Wextra																	\
-  -fPIC																	\
-  -O0																		\
-  -std=c++1y  																\
-  #-fmessage-length=0														\
-  #-ffunction-sections  														\
-  #-fdata-sections															\
-
-CPPFLAGS_DEBUG += 																\
-  $(addprefix -I,$(INCLUDES))												\
-  $(addprefix -D,$(CXX-DEFS))												\
-  $(if $(V),-v,)															\
-  -Wall																		\
-  -Wextra																	\
-  -O0																		\
-  -fPIC																	\
-  -std=c++1y  																\
-  #-fmessage-length=0														\
-  #-ffunction-sections  														\
-  #-fdata-sections															\
-  #-g \
-
-CFLAGS += 																	\
-  $(addprefix -I,$(INCLUDES))												\
-  $(shell pkg-config --cflags libusb-1.0)                                   \
-  $(addprefix -D,$(CXX-DEFS))												\
-  $(if $(V),-v,)															\
-  -Wall																		\
-  -fPIC																	\
-  -O0																		\
-  #-ffunction-sections 														\
-  #-fdata-sections 															\
-  #-std=gnu99 																\
-
-
-LDFLAGS +=																	\
-  -s 				 												\
-
-
-LDFLAGS_DEBUG +=																	\
-   				 												\
-
-vpath %.cpp $(subst $(eval) ,:,$(SRC-DIRS))
-vpath %.c   $(subst $(eval) ,:,$(SRC-DIRS))
-
-$(BUILD-DIR)/%.o: %.c | $(BUILD-DIR)
-	@echo "     $(BOLD)cc$(NORM)" $(notdir $<)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-$(BUILD-DIR)/%.o: %.cpp | $(BUILD-DIR)
-	@echo "    $(BOLD)c++$(NORM)" $(notdir $<)
-	$(CXX) $(CPPFLAGS) -c -o $@ $<
-
-.SECONDARY:
-
-$(TARGET-DIR)/libusbuart.so: $(addprefix $(BUILD-DIR)/,$(OBJS)) | $(TARGET-DIR)
-	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
-	$(LD) $(LDFLAGS) -shared -o $@ $^
-
-$(BUILD-DIR)::
-	@mkdir -p $@
-
-$(TARGET-DIR)::
-	@mkdir -p $@
+install: all
+	install -d $(PREFIX)/bin $(PREFIX)/lib $(PREFIX)/libexec/termux-radio
+	install -m755 $(TARGET-DIR)/libusbuart.so $(PREFIX)/lib/
+	install -m755 radio-bridge $(PREFIX)/bin/
+	install -m755 scripts/termux-radio $(PREFIX)/bin/
+	install -m644 scripts/radio_usb.py $(PREFIX)/libexec/termux-radio/
 
 clean:
-	@rm -f $(BUILD-DIR)/*.o *.map $(TARGET-DIR)/*.so
+	rm -f $(OBJECTS) $(BUILD-DIR)/*.d $(BUILD-DIR)/ptyserial.o $(BUILD-DIR)/uartcat.o $(BUILD-DIR)/radio-bridge.o
+	rm -f $(TARGET-DIR)/libusbuart.so ptyserial uartcat radio-bridge
 
-
-vpath %.cpp $(subst $(eval) ,:,examples)
-
-examples/%.o: %.cpp
-	@echo "    $(BOLD)c++$(NORM)" $(notdir $<)
-	$(CXX) $(CPPFLAGS) -c -o $@ $<
-
-uartcat: examples/uartcat.o
-	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
-	$(LD) $(LDFLAGS_DEBUG) -L$(TARGET-DIR)  -o $@ $< -lusbuart -lusb-1.0 $(shell pkg-config --libs libusb-1.0)
-	
-
-test: examples/test.o
-	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
-	$(LD) $(LDFLAGS_DEBUG) -L$(PREFIX)/lib/libusb-1.0 -L./bin -lusb-1.0 -lusbuart -o $@ $^
-
-ptyserial: examples/ptyserial.o # $(TARGET-DIR)/libusbuart.so
-	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
-	$(LD) $(LDFLAGS)  -o $@ $^ -lusbuart -lusb-1.0 $(shell pkg-config --libs libusb-1.0) 
-
+-include $(wildcard $(BUILD-DIR)/*.d)

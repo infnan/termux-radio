@@ -3,3 +3,10 @@
 *.swp
 *.swo
 .o
+/build/
+/bin/
+/radio-bridge
+/ptyserial
+/uartcat
+__pycache__/
+*.pyc

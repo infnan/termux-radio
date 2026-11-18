@@ -194,6 +194,10 @@ static registry& registrar() noexcept {
 	static registry reg;
 	return reg;
 }
+
+driver* make_driver(libusb_device_handle* handle, uint8_t ifc) throw(error_t) {
+	return registrar().create(handle, ifc);
+}
 /******************************************************************************/
 driver::factory::factory() noexcept {
 	registrar().add(this);
@@ -654,7 +658,6 @@ private:
 class context::backend {
 public:
 	backend() throw(error_t) {
-		libusb_set_option(NULL, LIBUSB_OPTION_WEAK_AUTHORITY);
 		libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
 
 		if( int err = libusb_init(&ctx) ) {
@@ -715,11 +718,16 @@ public:
 	libusb_device *open_usb_fd(int fd, libusb_device_handle **handle) {
 		libusb_device *device;
 
-		assert(!libusb_wrap_sys_device(ctx, (intptr_t) fd, handle));
+		int result = libusb_wrap_sys_device(ctx, (intptr_t) fd, handle);
+		if (result < 0) throw_error(__, result);
 		device = libusb_get_device(*handle);
 
 		struct libusb_device_descriptor desc;
-		assert(!libusb_get_device_descriptor(device, &desc));
+		result = libusb_get_device_descriptor(device, &desc);
+		if (result < 0) {
+			libusb_close(*handle);
+			throw_error(__, result);
+		}
 		log.i(__, "Device VID:PID %04x:%04x", desc.idVendor, desc.idProduct);
 
 		return device;
@@ -730,7 +738,8 @@ public:
 		validate(pi);
 		validate(ch);
 		libusb_device_handle *handle;
-		return attach(open_usb_fd(fd, &handle), ifc, ch, pi, false, handle);
+		libusb_device* device = open_usb_fd(fd, &handle);
+		return attach(device, ifc, ch, pi, false, handle);
 	}
 
 	int attach(libusb_device* dev, uint8_t ifc, channel& ch,
@@ -768,7 +777,8 @@ public:
 			const eia_tia_232_info& pi) throw(error_t) {
 		validate(pi);
 		libusb_device_handle *handle;
-		return attach(open_usb_fd(fd, &handle), 0, ch, pi, true, handle);
+		libusb_device* device = open_usb_fd(fd, &handle);
+		return attach(device, 0, ch, pi, true, handle);
 	}
 
 	void append_poll_list(vector<pollfd>& list) noexcept {

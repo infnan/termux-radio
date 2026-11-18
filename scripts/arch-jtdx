@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+
+PORTS = {"ft891": ("ft891-enhanced", "ft891-standard"), "g90": ("g90",)}
+DEFAULT_LAUNCHERS = (Path("/usr/bin/wsjtx"), Path("/usr/bin/jtdx"))
+
+
+def resolve_launcher(custom):
+    candidates = (Path(custom).expanduser().resolve(),) if custom else DEFAULT_LAUNCHERS
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    if custom:
+        raise RuntimeError(f"自定义启动器不存在或不可执行：{candidates[0]}")
+    raise RuntimeError("未找到 /usr/bin/wsjtx 或 /usr/bin/jtdx；请安装 WSJT-X/JTDX，或用 --launcher 指定自定义启动器。")
+
+
+def dialog(message, error=False):
+    print(message, file=sys.stderr, flush=True)
+    graphical = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if graphical and shutil.which("zenity"):
+        subprocess.run(["zenity", "--error" if error else "--info", "--title=WSJT-X / JTDX 电台 USB", "--text=" + message])
+    elif graphical and shutil.which("kdialog"):
+        subprocess.run(["kdialog", "--error" if error else "--msgbox", message, "--title", "WSJT-X / JTDX 电台 USB"])
+    elif graphical and shutil.which("xmessage"):
+        subprocess.run(["xmessage", "-center", "-buttons", "确定:0", message])
+
+
+def remote(args, action):
+    command = shlex.join([args.remote_command, action, "--json"] +
+                         (["--baud", str(args.baud), "--wait", str(args.wait), "--radio", args.radio] if action == "start" else []))
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                             "-p", str(args.port), args.ssh, command],
+                            text=True, capture_output=True, timeout=args.wait + 30 if action == "start" else 15)
+    try:
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("状态不是 JSON 对象")
+        return value
+    except ValueError as error:
+        raise RuntimeError(f"Termux {action} 失败：{result.stderr.strip() or result.stdout.strip() or result.returncode}") from error
+
+
+def usable(path):
+    if not isinstance(path, str) or not path.startswith("/dev/pts/") or not path[9:].isdigit():
+        return False
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        return stat.S_ISCHR(os.fstat(descriptor).st_mode) and os.isatty(descriptor)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def connected(value, requested):
+    if not value.get("running"):
+        return []
+    valid = []
+    for device in value.get("devices", []):
+        model = device.get("model")
+        if model not in PORTS or requested not in ("auto", model):
+            continue
+        ports = device.get("ports", {})
+        if all(usable(ports.get(name)) for name in PORTS[model]):
+            valid.append(device)
+    return valid
+
+
+def publish(directory, devices):
+    directory.mkdir(parents=True, exist_ok=True)
+    current = {name: target for device in devices for name, target in device["ports"].items()
+               if name in PORTS[device["model"]]}
+    for name in ("ft891-enhanced", "ft891-standard", "g90"):
+        link = directory / name
+        if name not in current:
+            if link.is_symlink():
+                link.unlink()
+            continue
+        temporary = directory / f".{name}.{os.getpid()}"
+        temporary.symlink_to(current[name])
+        temporary.replace(link)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="检查电台 PTY，必要时经 SSH 启动 Termux 桥接，再运行 WSJT-X/JTDX。")
+    parser.add_argument("--ssh", default=os.environ.get("RADIO_SSH", "u0_a299@localhost"))
+    parser.add_argument("--port", type=int, default=8022)
+    parser.add_argument("--remote-command", default="/data/data/com.termux/files/usr/bin/termux-radio")
+    parser.add_argument("--radio", choices=("auto", "ft891", "g90"), default="auto")
+    parser.add_argument("--baud", type=int, default=os.environ.get("RADIO_BAUD", "4800"))
+    parser.add_argument("--wait", type=int, default=60)
+    parser.add_argument("--link-dir", type=Path, default=Path(os.environ.get("RADIO_ARCH_LINK_DIR", "/run/termux-radio")))
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--launcher", metavar="PATH", help="自定义可执行程序或启动脚本；默认依次查找 /usr/bin/wsjtx、/usr/bin/jtdx")
+    args, program_arguments = parser.parse_known_args()
+    if program_arguments[:1] == ["--"]:
+        program_arguments = program_arguments[1:]
+    if not shutil.which("ssh"):
+        raise RuntimeError("缺少 ssh：请在 Arch 安装 openssh")
+    launcher = None if args.check_only else resolve_launcher(args.launcher)
+    try:
+        value = remote(args, "status")
+        devices = connected(value, args.radio)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        value, devices = {}, []
+    if not devices:
+        dialog("未检测到可访问的电台串口。即将通过 SSH 启动 Termux USB 桥接。\n"
+               "请插好电台 USB 线、解锁手机，并允许 Termux:API 的 USB 访问请求。")
+        value = remote(args, "start")
+        deadline = time.monotonic() + max(0, args.wait)
+        devices = connected(value, args.radio)
+        while not devices and time.monotonic() < deadline:
+            time.sleep(1)
+            value = remote(args, "status")
+            devices = connected(value, args.radio)
+    if not devices:
+        if value.get("ready"):
+            raise RuntimeError("Termux 桥接已就绪，但 Arch 无法访问所需 PTY。请确保使用同一个 Android UID，"
+                               "且 proot 绑定了宿主 /dev/pts（启动参数 -b /dev/pts:/dev/pts）。"
+                               "无法经 SSH 修改已经运行的 proot 的绑定，请退出后重新进入 Arch。")
+        raise RuntimeError("没有检测到就绪的电台。" + value.get("error", "") +
+                           " 请检查 Termux 授权和 termux-radio status 中的日志路径。")
+    publish(args.link_dir, devices)
+    print("串口就绪：" + ", ".join(str(args.link_dir / name) for device in devices for name in PORTS[device["model"]]), flush=True)
+    if args.check_only:
+        return 0
+    os.execv(launcher, [launcher, *program_arguments])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        dialog(str(error), error=True)
+        sys.exit(1)

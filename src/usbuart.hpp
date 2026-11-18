@@ -120,6 +120,8 @@ public:
 
 };
 
+driver* make_driver(libusb_device_handle*, uint8_t) throw(error_t);
+
 /**
  * implementation of common driver methods
  */
@@ -149,7 +151,7 @@ protected:
 	void release_interface() const noexcept;
 protected:
 	libusb_device_handle* const dev;
-	interface const & ifc;
+	const interface ifc;
 	const uint8_t ifcnum;
 	unsigned timeout; /** control transfer timeout */
 };
