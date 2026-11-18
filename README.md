@@ -125,14 +125,14 @@ install -Dm755 /你的项目路径/scripts/arch-jtdx ~/bin/arch-jtdx
 ~/bin/arch-jtdx
 ```
 
-`zenity` 用于对话框；也支持 `kdialog`、`xmessage`，无图形环境则输出终端提示。
+`zenity` 用于对话框；也支持 `kdialog`、`xmessage`，无图形环境则在终端提供同样的三选一输入。关闭对话框或终端输入结束按“中止”处理。
 默认读取 `ssh u0_a299@localhost -p 8022`，使用免密码认证和已确认的 SSH 主机密钥。
 Termux 端需要已经启动 `sshd`。脚本不会关闭 SSH 主机密钥检查。
 
 启动流程：
 
 1. 通过 SSH 获取 `termux-radio status --json`，检查对应 PTY 能否在 Arch 中以读写方式打开，且确实是 tty 字符设备。
-2. 如果未连接，显示提示对话框，然后经 SSH 执行 Termux 中安装的 `termux-radio start --baud 4800`，等待并重新检测。
+2. 如果未连接，显示“重试 / 中止 / 忽略”三选一对话框。“重试”先重新检查 TTY；仍失败才经 SSH 执行 `termux-radio start --baud 4800`，请求 USB 授权和桥接，完成后重新进入检测流程；失败时再次提供三选一。“中止”退出且不启动软件；“忽略”跳过 USB 获取、TTY 检测及链接更新，直接启动所选软件。
 3. 更新 `/run/termux-radio/` 下的固定链接；FT-891 必须两条 PTY 都可访问。
 4. 检测通过后默认依次查找并启动 `/usr/bin/wsjtx`、`/usr/bin/jtdx`；两者都安装时优先 WSJT-X。未安装时提示安装软件或指定自定义启动器。
 
@@ -147,7 +147,7 @@ Termux 端需要已经启动 `sshd`。脚本不会关闭 SSH 主机密钥检查�
 启动器参数使用 `--` 分隔并按原样传递，不经过 shell 解释。`--launcher` 只接受可执行文件路径，不接受拼接的 shell 命令。
 路径支持 `~`，含空格时加引号。
 
-可仅检测：`~/bin/arch-jtdx --check-only`（不要求安装 WSJT-X/JTDX 或自定义启动器）。只接受某台：`~/bin/arch-jtdx --radio ft891` 或 `--radio g90`。
+可仅检测：`~/bin/arch-jtdx --check-only`（不要求安装 WSJT-X/JTDX 或自定义启动器；失败直接返回非零，不弹三选一对话框、不获取 USB、不启动软件）。只接受某台：`~/bin/arch-jtdx --radio ft891` 或 `--radio g90`。
 其他用户用 `--ssh USER@HOST --port 8022`；远端命令可用 `--remote-command /绝对路径/termux-radio`。
 非 root 的 Arch 用户若不能写 `/run`，用 `--link-dir "$HOME/.local/run/termux-radio"`，并在 JTDX 填对应路径。
 环境变量：`RADIO_SSH`、`RADIO_ARCH_LINK_DIR`、`RADIO_BAUD`。

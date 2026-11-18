@@ -8,7 +8,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
 
 
 PORTS = {"ft891": ("ft891-enhanced", "ft891-standard"), "g90": ("g90",)}
@@ -34,6 +33,53 @@ def dialog(message, error=False):
         subprocess.run(["kdialog", "--error" if error else "--msgbox", message, "--title", "WSJT-X / JTDX 电台 USB"])
     elif graphical and shutil.which("xmessage"):
         subprocess.run(["xmessage", "-center", "-buttons", "确定:0", message])
+
+
+def choose_connection_action(message):
+    print(message, file=sys.stderr, flush=True)
+    graphical = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if graphical and shutil.which("zenity"):
+        result = subprocess.run(["zenity", "--question", "--title=WSJT-X / JTDX 电台 USB",
+                                 "--text=" + message, "--ok-label=重试", "--cancel-label=中止",
+                                 "--extra-button=忽略"], text=True, capture_output=True)
+        if result.stdout.strip() == "忽略" and result.returncode in (0, 1):
+            return "ignore"
+        return "retry" if result.returncode == 0 else "abort"
+    if graphical and shutil.which("kdialog"):
+        result = subprocess.run(["kdialog", "--yesnocancel", message, "--title", "WSJT-X / JTDX 电台 USB",
+                                 "--yes-label", "重试", "--no-label", "忽略", "--cancel-label", "中止"])
+        return {0: "retry", 1: "ignore"}.get(result.returncode, "abort")
+    if graphical and shutil.which("xmessage"):
+        result = subprocess.run(["xmessage", "-center", "-buttons", "重试:10,中止:11,忽略:12", message])
+        return {10: "retry", 12: "ignore"}.get(result.returncode, "abort")
+    while True:
+        try:
+            answer = input("请选择：重试(r) / 中止(a) / 忽略(i)：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "abort"
+        if answer in ("r", "重试"):
+            return "retry"
+        if answer in ("a", "中止"):
+            return "abort"
+        if answer in ("i", "忽略"):
+            return "ignore"
+
+
+def detect_radio(args):
+    try:
+        if not shutil.which("ssh"):
+            raise RuntimeError("缺少 ssh：请在 Arch 安装 openssh")
+        value = remote(args, "status")
+        devices = connected(value, args.radio)
+        if devices:
+            return devices, ""
+        if value.get("ready"):
+            return [], ("Termux 桥接已就绪，但 Arch 无法访问所需 PTY。请确保使用同一个 Android UID，"
+                        "且 proot 绑定了宿主 /dev/pts（启动参数 -b /dev/pts:/dev/pts）。"
+                        "无法经 SSH 修改已经运行的 proot 的绑定，请退出后重新进入 Arch。")
+        return [], "没有检测到就绪的电台。" + value.get("error", "")
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        return [], str(error)
 
 
 def remote(args, action):
@@ -108,31 +154,32 @@ def main():
     args, program_arguments = parser.parse_known_args()
     if program_arguments[:1] == ["--"]:
         program_arguments = program_arguments[1:]
-    if not shutil.which("ssh"):
-        raise RuntimeError("缺少 ssh：请在 Arch 安装 openssh")
     launcher = None if args.check_only else resolve_launcher(args.launcher)
-    try:
-        value = remote(args, "status")
-        devices = connected(value, args.radio)
-    except (RuntimeError, subprocess.TimeoutExpired):
-        value, devices = {}, []
-    if not devices:
-        dialog("未检测到可访问的电台串口。即将通过 SSH 启动 Termux USB 桥接。\n"
-               "请插好电台 USB 线、解锁手机，并允许 Termux:API 的 USB 访问请求。")
-        value = remote(args, "start")
-        deadline = time.monotonic() + max(0, args.wait)
-        devices = connected(value, args.radio)
-        while not devices and time.monotonic() < deadline:
-            time.sleep(1)
-            value = remote(args, "status")
-            devices = connected(value, args.radio)
-    if not devices:
-        if value.get("ready"):
-            raise RuntimeError("Termux 桥接已就绪，但 Arch 无法访问所需 PTY。请确保使用同一个 Android UID，"
-                               "且 proot 绑定了宿主 /dev/pts（启动参数 -b /dev/pts:/dev/pts）。"
-                               "无法经 SSH 修改已经运行的 proot 的绑定，请退出后重新进入 Arch。")
-        raise RuntimeError("没有检测到就绪的电台。" + value.get("error", "") +
-                           " 请检查 Termux 授权和 termux-radio status 中的日志路径。")
+    retry_error = ""
+    while True:
+        devices, detail = detect_radio(args)
+        if devices:
+            break
+        if args.check_only:
+            raise RuntimeError(detail)
+        message = ("未检测到可访问的电台串口。\n" + detail +
+                   ("\n上次重试失败：" + retry_error if retry_error else "") +
+                   "\n请插好电台 USB 线、解锁手机，并允许 Termux:API 的 USB 访问请求。\n"
+                   "重试：重新检查 TTY，必要时请求 Termux 获取 USB 后再检测。\n"
+                   "中止：结束程序。忽略：不连接电台，直接启动软件。")
+        action = choose_connection_action(message)
+        if action == "abort":
+            return 1
+        if action == "ignore":
+            os.execv(launcher, [launcher, *program_arguments])
+            return 0
+        retry_error = ""
+        devices, detail = detect_radio(args)
+        if not devices:
+            try:
+                remote(args, "start")
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                retry_error = str(error)
     publish(args.link_dir, devices)
     print("串口就绪：" + ", ".join(str(args.link_dir / name) for device in devices for name in PORTS[device["model"]]), flush=True)
     if args.check_only:
