@@ -1,2 +1,4 @@
 /Makefile text eol=lf
 /scripts/* text eol=lf
+/README.md text eol=lf
+/examples/radio-bridge.cpp text eol=lf

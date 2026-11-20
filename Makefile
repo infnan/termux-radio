@@ -32,8 +32,8 @@ install: all
 	install -d $(PREFIX)/bin $(PREFIX)/lib $(PREFIX)/libexec/termux-radio
 	install -m755 $(TARGET-DIR)/libusbuart.so $(PREFIX)/lib/
 	install -m755 radio-bridge $(PREFIX)/bin/
-	install -m755 scripts/termux-radio $(PREFIX)/bin/
-	install -m644 scripts/radio_usb.py $(PREFIX)/libexec/termux-radio/
+	install -m755 scripts/termux-usb-serial scripts/termux-radio $(PREFIX)/bin/
+	install -m644 scripts/termux_usb_serial.py $(PREFIX)/libexec/termux-radio/
 
 clean:
 	rm -f $(OBJECTS) $(BUILD-DIR)/*.d $(BUILD-DIR)/ptyserial.o $(BUILD-DIR)/uartcat.o $(BUILD-DIR)/radio-bridge.o

@@ -19,7 +19,51 @@ API_HELP = (
 )
 STOPPING = False
 USB_PATH = re.compile(r"^/dev/bus/usb/[0-9]{3}/[0-9]{3}$")
-MODEL_NAMES = {"ft891": ("ft891-enhanced", "ft891-standard"), "g90": ("g90",)}
+MODELS = ("ft891", "ic7300", "g90", "g90s", "g90n", "x6100", "x6200", "ic705", "ftdx10", "ft710")
+PORT_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
+
+
+def identify_model(value):
+    text = " ".join([value.get("manufacturer", ""), value.get("product", ""),
+                     *(item.get("name", "") for item in value.get("interfaces", []))]).lower()
+    matches = {model for model in MODELS if re.search(
+        r"(?<![a-z0-9])" + r"[\s_-]*".join(re.findall(r"[a-z]+|[0-9]+", model)) + r"(?![a-z0-9])", text)}
+    return matches.pop() if len(matches) == 1 else "generic"
+
+
+def port_names(value, model, state, children, usb_path, enhanced=0, standard=1):
+    occupied = {name for child in children.values() for name in child[1].get("ports", {})}
+    interfaces = value["interfaces"]
+    if model != "generic":
+        base = model
+        instance = 2
+        while any(name == base or name.startswith(base + "-") for name in occupied):
+            base = f"{model}-{instance}"
+            instance += 1
+        dual = value.get("part") == 5 and len(interfaces) == 2
+        if dual:
+            if {item["number"] for item in interfaces} != {enhanced, standard}:
+                raise RuntimeError("Enhanced / Standard 接口编号与设备不符")
+            return [base + ("-enhanced" if item["number"] == enhanced else "-standard") for item in interfaces]
+        return [base] if len(interfaces) == 1 else [f"{base}-port{item['number']}" for item in interfaces]
+    assignments = read_json(state / "port-names.json")
+    identity = [value.get("vid"), value.get("product_id"), value.get("serial") or usb_path]
+    names = []
+    reserved = set(assignments.values()) | occupied
+    for item in interfaces:
+        key = json.dumps([*identity, item["number"]])
+        name = assignments.get(key)
+        if not isinstance(name, str) or not re.fullmatch(r"ttyUSB[0-9]+", name) or name in occupied:
+            index = 0
+            while f"ttyUSB{index}" in reserved:
+                index += 1
+            name = f"ttyUSB{index}"
+            assignments[key] = name
+        reserved.add(name)
+        occupied.add(name)
+        names.append(name)
+    atomic_json(state / "port-names.json", assignments)
+    return names
 
 
 def stopped(signum, frame):
@@ -82,7 +126,10 @@ def sysfs_identity(path):
 
 
 def compatible(identity):
-    return identity == (0x10C4, 0xEA70) or identity in ((0x0403, 0x6001), (0x0403, 0x6015))
+    return identity in ((0x10C4, 0xEA60), (0x10C4, 0xEA70), (0x10C4, 0xEA71),
+                        (0x0403, 0x6001), (0x0403, 0x6015), (0x0403, 0x6010),
+                        (0x0403, 0x6011), (0x0403, 0x6014), (0x1A86, 0x7523),
+                        (0x1A86, 0x5523), (0x4348, 0x5523), (0x067B, 0x2303))
 
 
 def terminate(process, record):
@@ -119,7 +166,7 @@ def remove_record(path, links):
         if alive(record):
             raise RuntimeError("旧桥接进程未能停止，避免同时打开同一 USB 设备。")
     for name, target in record.get("ports", {}).items():
-        if name not in MODEL_NAMES.get(record.get("model"), ()):
+        if not PORT_NAME.fullmatch(name):
             continue
         link = links / name
         if link.is_symlink() and os.readlink(link) == target:
@@ -134,9 +181,8 @@ def snapshot(state, links):
         for path in sorted(state.glob("device-*.json")):
             value = read_json(path)
             if value.get("ready") and alive(value):
-                expected = MODEL_NAMES.get(value.get("model"), ())
                 ports = value.get("ports", {})
-                if expected and all(name in ports and Path(ports[name]).exists() for name in expected):
+                if ports and all(PORT_NAME.fullmatch(name) and Path(target).exists() for name, target in ports.items()):
                     devices.append(value)
     return {"running": alive(supervisor), "ready": bool(devices), "devices": devices,
             "settings": {name: supervisor.get(name) for name in ("baud", "baud_mode", "radio")},
@@ -226,18 +272,21 @@ def serve(args, state, links, bridge):
                         identity_report = wait_report(process, probe_file, 40)
                         terminate(process, identity_report)
                     probe_file.unlink(missing_ok=True)
-                    model = identity_report.get("model")
+                    model = identify_model(identity_report)
                     print(f"{path}: {json.dumps(identity_report, ensure_ascii=False)}", flush=True)
-                    if identity_report and model not in MODEL_NAMES:
+                    supported = compatible((identity_report.get("vid"), identity_report.get("product_id")))
+                    if identity_report and not supported:
                         examined[path] = float("inf")
-                    if model not in MODEL_NAMES or args.radio not in ("auto", model):
+                    if not supported or not identity_report.get("interfaces"):
                         continue
-                    if any(child[1].get("model") == model for child in children.values()):
-                        print(f"已有 {model}；忽略同类第二个适配器 {path}，避免覆盖固定路径。", flush=True)
-                        continue
-                    ready_file = state / f"device-{model}.json"
+                    if args.radio != "auto":
+                        if model not in ("generic", args.radio):
+                            continue
+                        model = args.radio
+                    names = port_names(identity_report, model, state, children, path, args.enhanced, args.standard)
+                    ready_file = state / f"device{suffix}.json"
                     ready_file.unlink(missing_ok=True)
-                    arguments = ["--radio", model, "--link-dir", str(links), "--report", str(ready_file),
+                    arguments = ["--radio", model, "--port-names", ",".join(names), "--link-dir", str(links), "--report", str(ready_file),
                                  "--baud", str(args.baud), "--baud-mode", args.baud_mode,
                                  "--enhanced", str(args.enhanced), "--standard", str(args.standard)]
                     with (state / "service.log").open("a") as output:
@@ -253,7 +302,7 @@ def serve(args, state, links, bridge):
                         continue
                     atomic_json(ready_file, record)
                     children[path] = (process, record, ready_file)
-                    print(f"{model} 兼容适配器已就绪：{record['ports']}", flush=True)
+                    print(f"{model} 串口已就绪：{record['ports']}", flush=True)
             deadline = time.monotonic() + 2
             while not STOPPING and time.monotonic() < deadline:
                 time.sleep(0.2)
@@ -269,11 +318,11 @@ def serve(args, state, links, bridge):
 
 
 def parser():
-    result = argparse.ArgumentParser(description="Termux USB 电台串口后台服务；拔线后等待重连，stop 才主动停止。")
+    result = argparse.ArgumentParser(description="Termux 宿主 USB 串口后台服务；拔线后等待重连，stop 才主动停止。")
     result.add_argument("action", choices=("start", "status", "stop", "__serve"), nargs="?", default="start")
     result.add_argument("--baud", type=int, default=os.environ.get("RADIO_BAUD", "4800"))
     result.add_argument("--baud-mode", choices=("follow", "fixed"), default=os.environ.get("RADIO_BAUD_MODE", "follow"))
-    result.add_argument("--radio", choices=("auto", "ft891", "g90"), default="auto")
+    result.add_argument("--radio", choices=("auto", *MODELS), default="auto", help="手工指定已知连接的设备型号；默认仅根据 USB 名称识别")
     result.add_argument("--enhanced", type=int, default=0)
     result.add_argument("--standard", type=int, default=1)
     result.add_argument("--wait", type=int, default=50, help="start 等待就绪的秒数；超时不停止后台服务")
@@ -306,7 +355,7 @@ def main():
                 raise RuntimeError("停止尚未完成，请检查 service.log 后重试 status")
         for path in state.glob("device-*.json"):
             remove_record(path, links)
-        print("电台 USB 后台服务已停止。")
+        print("USB 串口后台服务已停止。")
         return 0
     if args.action == "start":
         if not bridge.is_file() or not os.access(bridge, os.X_OK):
@@ -314,7 +363,7 @@ def main():
         usb_devices()
         current = snapshot(state, links)
         if current["running"] and current["settings"] != {"baud": args.baud, "baud_mode": args.baud_mode, "radio": args.radio}:
-            print("已运行的服务保留原配置；如需更改，请先 termux-radio stop，再 start。", file=sys.stderr)
+            print("已运行的服务保留原配置；如需更改，请先 termux-usb-serial stop，再 start。", file=sys.stderr)
         if not current["running"]:
             arguments = [sys.executable, str(Path(__file__).resolve()), "__serve", "--baud", str(args.baud),
                          "--baud-mode", args.baud_mode, "--radio", args.radio,
@@ -333,7 +382,7 @@ def main():
     else:
         print(json.dumps(current, ensure_ascii=False, indent=2))
         if current["running"] and not current["ready"]:
-            print("服务继续等待插入电台。解锁手机并允许 USB 授权；日志：" + current["log"])
+            print("服务继续等待插入串口设备。解锁手机并允许 USB 授权；日志：" + current["log"])
     return 0 if args.action == "status" or current["ready"] else 1
 
 

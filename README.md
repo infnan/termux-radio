@@ -1,191 +1,242 @@
-## USBUART
- A cross-platform library for reading/wring data via USB-UART adapters
+# termux-radio
 
-### Introduction
+注意：本项目面向**希望在 Android 上运行电脑版 WSJT-X 或 JTDX，已经准备好 Linux 运行环境，却卡在 USB 串口连接这一步**的用户，帮助这些软件连接电台。如果只是希望在 Android 上完成 FT8 通联，可以直接使用 [FT8CN](https://github.com/N0BOY/FT8CN)，不必为了通联搭建电脑版软件环境。
 
-`USBUART` is a LIBUSB based library that implements a relay from USB-UART 
-converter’s endpoints to a pair of I/O resources, either appointed by given 
-file descriptors, or created inside the library with pipe[(2)](http://linux.die.net/man/2/pipe).
+把 Android 手机连接的 USB 串口变成 Linux 软件可以打开的串口，用手机上的 **WSJT-X / JTDX 控制电台，完成 FT8 通联**。也可以给串口终端、对讲机写频工具或单片机程序使用。
 
-User application may then use standard I/O operations for reading and writing data.
-USBUART Library provides API for three languages - C++, C and Java.
+无需 root。USB 设备由 Termux 宿主获取 Android 授权，后台服务建立串口；运行在 proot 发行版中的软件通过固定路径使用它。发行版可以是 Debian、Ubuntu、Arch 等，也可以由 proot-distro 管理。
 
-See C/C++ API description in [usbuart.h](usbuart_8h.html) and Android API in 
+本项目基于 [thingsapart/usbuart-termux](https://github.com/thingsapart/usbuart-termux) 修改，其 USBUART 库源自 [Eugene Hutorny 的 usbuart](https://github.com/hutorny/usbuart)。感谢原作者和上游贡献者；CP210x 支持参考 Linux 内核驱动，详细来源见文末。
 
-### Usage with C++
+本项目完全使用AI修改。
 
-	// Instantiate a context
-	context ctx;
-	
-	// Attach USB via a pipe channel
-	channel chnl;
-	ctx.pipe(device_id{0x067b,0x0609},chnl,_115200_8N1n);
-	
-	//Run loop in one thread
-	while(ctx.loop(10) >= -error_t::no_channel);
-	
-	//Read/write data in other thread(s)
-	char buff[256];
-	read(chnl.fd_read, buff, sizeof(buff));
-	
-	//or use non-blocking I/O in the loop body
+## 准备环境
 
-## Termux + Arch proot：FT-891 / G90 的 USB 串口
+- Android 手机支持 USB OTG，USB 线已接好电台或串口设备。
+- 已安装 Termux，以及与 Termux 来源、签名匹配的 **Termux:API Android 应用**。
+- 已有可以运行图形软件的 proot Linux 环境，并安装 WSJT-X 或 JTDX。
+- 通联前准备好音频输入输出和系统时间。本项目负责 USB 串口连接。
 
-`radio-bridge` 在 Termux 中通过 Android 授权的 USB 文件描述符访问串口芯片，创建 raw PTY。
-Arch 中的 JTDX/Hamlib 打开 PTY，即可收发 CAT 数据。无需 root，也不要求 Android 有 `/dev/ttyUSB0`。
+项目包含 CP210x、FTDI、CH34x 和 PL2303 串口驱动。下面的流程优先以 FT-891 为例，串口参数请与自己的电台一致。
 
-| USB 适配器 | 通道 | Termux 固定链接（默认目录 `~/.local/run/termux-radio/`） | Arch 固定链接 |
-| --- | --- | --- | --- |
-| FT-891 兼容 CP2105，`10c4:ea70`、part 5 | Enhanced，默认 interface 0 | `ft891-enhanced` | `/run/termux-radio/ft891-enhanced` |
-| 同上 | Standard，默认 interface 1 | `ft891-standard` | `/run/termux-radio/ft891-standard` |
-| G90 兼容单通道 FTDI，`0403:6001` / `0403:6015` | CAT | `g90` | `/run/termux-radio/g90` |
+## 1. 在 Termux 宿主安装
 
-USB VID/PID、芯片型号和接口只能确认**适配器兼容性**，不能证明后面接的电台型号。普通 FT232 线也会被识别为 G90 兼容线。
-默认不会发送 CAT 查询或 PTT 命令来猜测型号。CP2105 按芯片定义将 interface 0 映射到 Enhanced，1 映射到 Standard；状态 JSON 同时提供实际接口描述符。
-其他 CP210x 的 `10c4:ea60/ea71` 可由库驱动使用，但不会被自动当成 FT-891。
-
-### 在 Termux 安装和启动
-
-先安装与 Termux 来源/签名匹配的 **Termux:API Android 应用**，然后在 Termux 中：
+以下命令在 **Termux 中执行，不是在发行版中**。在 Termux 的 home 下下载源码并安装：
 
 ```bash
-pkg install termux-api python clang libusb make pkg-config
+pkg install git termux-api python clang libusb make pkg-config
+cd ~
+git clone https://github.com/infnan/termux-radio.git
+cd termux-radio
 make -j2
 make install
-termux-radio start
 ```
 
-源码应放在 Termux 的私有 home 中，避免 Android 共享存储的执行权限和符号链接限制。
-`make install` 使用 Termux 的 `$PREFIX`。在普通 Linux 中安装时需要自行指定有写权限的 `PREFIX`。
-
-脚本先执行 `termux-usb -l` 检查 API 是否可用；没有命令、API 无响应、未安装配套应用时会给出安装提示。
-它逐个检查列出的 `/dev/bus/usb/xxx/xxx`，优先读取可访问的 sysfs VID/PID 排除其他设备，再通过 `termux-usb -r -e` 获取权限并读 USB 描述符。
-**Android 经常禁止读取 sysfs；此时在识别前就必须请求 USB 权限，可能对其他 USB 设备也出现一次授权提示。**
-`termux-usb -l` 本身只返回路径，无法保证“先知道型号、再申请权限”。
-
-服务在后台每两秒检查插拔；首次授权需解锁手机并允许提示。FT-891 建立两条 PTY，FTDI 建立一条。
-拔线或桥接错误会清理失效链接并等待重连，关闭启动终端和退出 JTDX 不会主动停止服务。
-Android 强制停止、系统杀进程、重启仍会中断服务；脚本无法保证进程永远不被系统回收。
-服务请求 Termux wake lock，并在正常停止时释放；Android 电池设置也应允许 Termux/Termux:API 后台运行。
+插好 USB 线，解锁手机，启动服务并允许 Android 弹出的 USB 访问请求：
 
 ```bash
-termux-radio status
-termux-radio status --json
-termux-radio stop
+termux-usb-serial start
+termux-usb-serial status
 ```
 
-`start` 默认等待 50 秒，未就绪返回非零，但**已启动的后台服务继续等待插线**。
-重复 `start` 不会启动第二套服务，也不会改变现有服务的参数。要换参数先 `stop`。
-日志：`~/.local/state/termux-radio/service.log`。
-
-### 波特率：软件同步与固定模式
-
-PTY 自身的波特率不会影响 USB 芯片。桥接程序保留 slave FD，通过 `tcgetattr(slave)` 读取 JTDX/Hamlib 的 termios 波特率，
-在发送串口数据前同步到 USB 芯片，并在事件循环中检查空闲时的变更。没有依赖 `TIOCPKT_IOCTL`，后者在 Linux 上不能作为通用串口设置通知。
-
-| 启动入口 | 初始速率 | 后续 JTDX 改速率 |
-| --- | --- | --- |
-| `radio-bridge` | 默认 115200，`--baud` 优先于 `USBUART_BAUD` | 默认 `follow`，同步到 USB |
-| `termux-radio start` | 默认 4800，`--baud` 优先于 `RADIO_BAUD` | 默认 `follow` |
-| `--baud-mode fixed` | 使用指定初始值 | 忽略 PTY 的速率变化 |
+初始波特率为 **4800**；软件打开串口后设置的波特率会同步到 USB 串口。更改初始值或固定波特率：
 
 ```bash
-termux-radio start --baud 4800
-termux-radio stop
-termux-radio start --baud 4800 --baud-mode fixed
+termux-usb-serial stop
+termux-usb-serial start --baud 9600
+# 或固定使用 4800，不跟随软件修改
+termux-usb-serial stop
+termux-usb-serial start --baud 4800 --baud-mode fixed
 ```
 
-环境变量也可设置：`RADIO_BAUD=4800 RADIO_BAUD_MODE=fixed termux-radio start`。
-底层支持 1200/2400/4800/9600/19200/38400/57600/115200/230400；电台只接受其中的一部分。
-软件同步只覆盖这些标准 termios 波特率，不支持 `BOTHER` 自定义速率；`B0` 不转发为断线。
-FT-891 Enhanced 固定 8N2（与 Hamlib 的 FT-891 后端默认值一致），Standard 和 G90 固定 8N1；全部无流控。
-其他数据位/校验/停止位设置不会同步，请在 JTDX 中选择对应设置。
-
-**FT-891 的 CAT 不支持 115200。** 你家机器设为 4800 时，保持电台、脚本、JTDX 都为 4800。
-FT-891 菜单 `05-06 CAT RATE = 4800`，`05-08 CAT RTS = DISABLE`。
-
-### 在 Arch 安装和启动 WSJT-X / JTDX
-
-Arch 与 Termux 必须运行在同一 Android UID 下，proot 必须能访问宿主的 `/dev/pts`。
-proot-distro 默认配置通常已提供它；自定义 proot 启动脚本可加入：
+服务在后台持续运行，拔线后会等待重新连接。关闭 WSJT-X/JTDX 不会停止它。手工停止：
 
 ```bash
--b /dev/pts:/dev/pts
+termux-usb-serial stop
 ```
 
-不必把 Termux home 中的固定链接目录绑定进来。Arch 启动器通过 SSH 读取当前 PTY 路径，再创建自己的固定链接。
-**SSH 命令不能修改已运行的 proot 的路径绑定。** 如果 `/dev/pts` 不可见，需要退出 Arch、调整启动参数后重进。
+如果启动时还没插设备，命令等待一段时间后返回，后台服务仍继续等待。
 
-在 Arch 中安装：
+## 2. 确认串口名称
+
+`termux-usb-serial status` 中的 `ports` 会列出串口名和当前 `/dev/pts/...` 路径。Termux 侧的固定链接位于：
+
+```text
+~/.local/run/termux-radio/
+```
+
+USB 产品名称明确包含型号时，使用型号命名。可识别的名称包括 FT-891、IC-7300、G90/G90S/G90N、X6100、X6200、IC-705、FTDX10 和 FT-710。这里列的是**名称识别规则**；实际连接还需要设备使用项目支持的 USB 串口接口。
+
+| 情况 | 串口名称示例 |
+| --- | --- |
+| 名称中有 FT-891，且为双通道 CP2105 | `ft891-enhanced`、`ft891-standard` |
+| 名称中有 G90，且为单通道 | `g90` |
+| 名称中有 IC-7300，且为单通道 | `ic7300` |
+| 没有明确型号的 CP210x、FT232 等串口 | `ttyUSB0`、`ttyUSB1`…… |
+
+普通 FT232 写频线会得到通用名称，不会自动当成 G90。多个设备可以同时使用；同型号设备会增加编号。
+
+如果电台只报告芯片名称，可在确认接线后手工指定型号。例如自己的 FT-891：
 
 ```bash
-pacman -S --needed python openssh zenity
-install -Dm755 /你的项目路径/scripts/arch-jtdx ~/bin/arch-jtdx
-~/bin/arch-jtdx
+termux-usb-serial stop
+termux-usb-serial start --radio ft891 --baud 4800
 ```
 
-`zenity` 用于对话框；也支持 `kdialog`、`xmessage`，无图形环境则在终端提供同样的三选一输入。关闭对话框或终端输入结束按“中止”处理。
-默认读取 `ssh u0_a299@localhost -p 8022`，使用免密码认证和已确认的 SSH 主机密钥。
-Termux 端需要已经启动 `sshd`。脚本不会关闭 SSH 主机密钥检查。
+这会生成 Enhanced 和 Standard 两个名称，并为 FT-891 Enhanced 设置 8N2。G90 可用 `--radio g90`。手工指定型号时，请只连接需要使用的那个串口设备。
 
-启动流程：
+## 3. 在发行版中使用
 
-1. 通过 SSH 获取 `termux-radio status --json`，检查对应 PTY 能否在 Arch 中以读写方式打开，且确实是 tty 字符设备。
-2. 如果未连接，显示“重试 / 中止 / 忽略”三选一对话框。“重试”先重新检查 TTY；仍失败才经 SSH 执行 `termux-radio start --baud 4800`，请求 USB 授权和桥接，完成后重新进入检测流程；失败时再次提供三选一。“中止”退出且不启动软件；“忽略”跳过 USB 获取、TTY 检测及链接更新，直接启动所选软件。
-3. 更新 `/run/termux-radio/` 下的固定链接；FT-891 必须两条 PTY 都可访问。
-4. 检测通过后默认依次查找并启动 `/usr/bin/wsjtx`、`/usr/bin/jtdx`；两者都安装时优先 WSJT-X。未安装时提示安装软件或指定自定义启动器。
+### 方式 A：先在 Termux 启动，再直接打开软件
 
-用 `--launcher` 选择程序或自定义启动脚本；自定义脚本不是默认依赖。例如：
+这是最简单的用法，**不需要 SSH**。
+
+Termux 中启动服务后，将固定串口目录提供给发行版。以 proot-distro 的 Debian 为例，以下命令仍在 **Termux 中执行**：
 
 ```bash
-~/bin/arch-jtdx --launcher /usr/bin/jtdx
-~/bin/arch-jtdx --launcher ~/bin/jtdx-fix
-~/bin/arch-jtdx --launcher ~/bin/jtdx-fix -- --rig-name FT891
+proot-distro login debian --bind "$HOME/.local/run/termux-radio:/run/termux-serial"
 ```
 
-启动器参数使用 `--` 分隔并按原样传递，不经过 shell 解释。`--launcher` 只接受可执行文件路径，不接受拼接的 shell 命令。
-路径支持 `~`，含空格时加引号。
+换用其他发行版时，把 `debian` 换成对应名称。自行编写 proot 启动命令的用户，将上述宿主目录绑定到 `/run/termux-serial`，并保证宿主 `/dev/pts` 在发行版中可见。
 
-可仅检测：`~/bin/arch-jtdx --check-only`（不要求安装 WSJT-X/JTDX 或自定义启动器；失败直接返回非零，不弹三选一对话框、不获取 USB、不启动软件）。只接受某台：`~/bin/arch-jtdx --radio ft891` 或 `--radio g90`。
-其他用户用 `--ssh USER@HOST --port 8022`；远端命令可用 `--remote-command /绝对路径/termux-radio`。
-非 root 的 Arch 用户若不能写 `/run`，用 `--link-dir "$HOME/.local/run/termux-radio"`，并在 JTDX 填对应路径。
-环境变量：`RADIO_SSH`、`RADIO_ARCH_LINK_DIR`、`RADIO_BAUD`。
-
-### JTDX 配置和通联验收
-
-FT-891 的 CAT 串口填 `/run/termux-radio/ft891-enhanced`，G90 填 `/run/termux-radio/g90`。
-选择对应 Rig，4800、Handshake None；FT-891 的 CAT 设为 8N2，G90 设为 8N1。FT-891 优先使用 **CAT PTT**。
-Standard PTY 可用于数据字节收发，**不支持将 JTDX 的 RTS/DTR modem ioctl 转成物理控制线**。
-Linux 普通 PTY 无法像真正的 USB 串口那样实现这些 ioctl；不能据此把 Standard PTY 当作已经完成的 RTS/DTR PTT 方案。
-
-先 Test CAT，验证读取/设置频率，再 Test PTT 验证能进入和退出发射。
-检测脚本只证明桥接进程和 PTY 可访问，不证明 CAT 协议、电台连接或发射正常。
-FT-891 的非发射查询可用 `FA;`，预期收到 `FA` 加频率和分号。
-G90 请使用 Hamlib 对应机型进行查询，不要套用 Yaesu 指令。
-热插拔后路径保持固定，但旧进程已打开的 FD 无法自动切换到新 PTY；重新测试 CAT 或重新运行 Arch 启动器。
-
-### 底层手工调试
+进入发行版后检查：
 
 ```bash
-mkdir -p "$HOME/.local/run/termux-radio"
-termux-usb -l
-termux-usb -r -e "radio-bridge --link-dir $HOME/.local/run/termux-radio --baud 4800" /dev/bus/usb/001/002
+ls -l /run/termux-serial/
 ```
 
-设备路径以实际输出为准。`radio-bridge --help` 显示全部选项；`--probe --report /绝对路径/probe.json` 只读取描述符，不创建 PTY。
-CP2105 非标准映射可通过 `termux-radio start --enhanced N --standard N` 覆盖，或直接传给 `radio-bridge`。
-单独手工启动时不要再运行后台服务占用同一个设备。
-原来的 `ptyserial` 仍作为运行子进程的示例保留；电台连接请使用 `radio-bridge`，避免 shell 输出进入 CAT 通道。
+随后在自己的图形桌面中启动 `/usr/bin/wsjtx` 或 `/usr/bin/jtdx`，按下一节填写串口路径。
 
-### 实现参考与验证边界
+### 方式 B：发行版内一键检查、连接并启动软件
 
-- CP210x 的 USB 请求编号、CP2105 通道划分参考 Linux 内核 `drivers/usb/serial/cp210x.c` 和 Silicon Labs AN571；驱动在用户态通过 libusb 实现，没有加载内核模块。
-- 协议说明：[Silicon Labs AN571](https://www.silabs.com/documents/public/application-notes/AN571.pdf)。
-- 内核参考：[cp210x.c](https://github.com/torvalds/linux/blob/master/drivers/usb/serial/cp210x.c)、[pty.c](https://github.com/torvalds/linux/blob/master/drivers/tty/pty.c)。
-- 授权接口：[termux-usb](https://github.com/termux/termux-api-package/blob/master/scripts/termux-usb.in)。
-- 串口默认值：[Hamlib FT-891 后端](https://github.com/Hamlib/Hamlib/blob/master/rigs/yaesu/ft891.c)。
+此方式通过 SSH 调用 Termux，适合希望点击启动器就自动检查 USB 的用户。已有 Termux 免密 SSH 配置可以直接沿用；初次设置见文末附录。
 
-桌面 Linux 的编译、PTY 行为和模拟设备测试不能代替 Android 手机、电台的实机验收。
+将项目的发行版脚本复制到发行版可访问的位置。在 **发行版内、源码目录中**安装：
 
+```bash
+install -Dm755 scripts/distro-wsjt ~/.local/bin/distro-wsjt
+install -Dm755 scripts/distro-usb-serial ~/.local/bin/distro-usb-serial
+```
 
+发行版需要 Python 3、OpenSSH 客户端；图形对话框可安装 Zenity。例如：
+
+```bash
+# Debian / Ubuntu
+sudo apt install python3 openssh-client zenity
+# Arch
+sudo pacman -S --needed python openssh zenity
+```
+
+如果当前已是 root，省略 `sudo`。安装完成后运行：
+
+```bash
+~/.local/bin/distro-wsjt
+```
+
+脚本优先使用 `/usr/bin/wsjtx`，其次使用 `/usr/bin/jtdx`。自定义启动器作为可选参数：
+
+```bash
+~/.local/bin/distro-wsjt --launcher "$HOME/bin/jtdx-fix"
+```
+
+没有可访问的串口时，提供三个选项：
+
+- **重试**：重新检测串口；必要时调用 Termux 获取 USB 权限、启动桥接，再次检测。
+- **中止**：结束，不启动软件。
+- **忽略**：直接启动软件。
+
+连接成功后，发行版固定串口目录为 `~/.local/run/termux-serial/`。需要沿用方式 A 的路径时，添加 `--link-dir /run/termux-serial`。
+
+多个设备同时连接时，可以选择串口，例如 `--device ttyUSB0`。只连接串口、供其他程序使用：
+
+```bash
+~/.local/bin/distro-usb-serial --device ttyUSB0
+```
+
+`--check-only` 只检查并建立发行版链接，不弹框、不申请权限、不启动软件。旧入口 `termux-radio` 和 `arch-jtdx` 保留兼容；新部署请使用明确区分宿主、发行版的名称。
+
+## 4. WSJT-X / JTDX 设置
+
+在软件的 **Settings → Radio** 中：
+
+1. **Rig**：选择实际电台型号。
+2. **Serial Port**：填写固定串口路径。方式 A 的 FT-891 为 `/run/termux-serial/ft891-enhanced`；方式 B 默认为 `/home/你的用户名/.local/run/termux-serial/ft891-enhanced`，使用 root 时是 `/root/.local/run/termux-serial/ft891-enhanced`。按实际 home 填写完整路径，不要填写 `~`。
+3. **Baud Rate**：与电台 CAT 设置一致，例如 4800。
+4. FT-891 使用 **8 数据位、无校验、2 停止位、Handshake None**。其他设备按自己的 CAT 要求设置。
+5. **PTT Method** 选择 **CAT**。
+6. 点击 **Test CAT**，成功后测试 PTT，再配置好音频设备，开始通联。
+
+如果使用通用名称，将串口路径最后一段换成实际的 `ttyUSB0`。FT-891 的 CAT 使用 Enhanced 通道，Standard 通道同时保留给其他用途。
+
+## 常见问题
+
+### 找不到 USB 设备，或一直等授权
+
+在 Termux 执行 `termux-usb -l`，检查 USB 线、OTG 连接和 Termux:API。手机保持解锁，允许 USB 弹窗。如果没有安装配套 Android 应用，仅安装 `termux-api` 命令行包还不够；启动脚本会给出提示。
+
+查看日志：
+
+```bash
+tail -n 80 ~/.local/state/termux-radio/service.log
+```
+
+### 显示 ttyUSB0，而不是电台型号
+
+这通常是设备只提供了串口芯片名称。直接把 `ttyUSB0` 填入软件即可；需要型号名称或 FT-891 的双通道配置时，按前文用 `--radio` 手工指定。
+
+### Termux 已就绪，发行版打不开串口
+
+检查两边是否属于同一个 Termux 安装，并确认发行版能够访问链接指向的 `/dev/pts/数字`。自行配置 proot 时可绑定 `-b /dev/pts:/dev/pts`，修改绑定后重新进入发行版。固定目录绑定也要在进入发行版前完成。
+
+### Test CAT 失败
+
+检查是否选中了正确的电台、CAT 通道和波特率，并关闭其他占用串口的软件。FT-891 使用 Enhanced 通道和 8N2；如果设备名称不含型号，先用 `--radio ft891` 重新启动服务。PTT 使用 CAT，不选串口 RTS/DTR。
+
+### 拔插后软件不再响应
+
+等待宿主服务重新建立串口，再在软件中关闭、重新打开串口，或重启 WSJT-X/JTDX。有 USB 序列号的通用串口会记住编号；没有序列号的设备换 USB 地址后，可在 `status` 中查看新名称。
+
+### 修改启动参数没有生效
+
+已经运行的宿主服务保留原参数。执行 `termux-usb-serial stop`，再用新参数 `start`。
+
+## 附录：配置发行版调用 Termux 的 SSH
+
+**已有免密连接就跳过本节。** `distro-wsjt` 会从当前 Android UID 自动推导 Termux 用户名，默认连接 `localhost:8022`；也可用 `--ssh` 或 `RADIO_SSH` 显式指定。账号不是固定的，每台设备以 Termux 中 `whoami` 的输出为准。
+
+在 **Termux 宿主**执行：
+
+```bash
+pkg install openssh
+whoami
+passwd
+sshd
+```
+
+在 **发行版内**生成密钥并复制到 Termux，把 `你的Termux用户名` 替换为上一步结果：
+
+```bash
+ssh-keygen -t ed25519
+ssh-copy-id -p 8022 你的Termux用户名@localhost
+ssh -o BatchMode=yes -p 8022 你的Termux用户名@localhost true
+```
+
+已有密钥时复用即可，不覆盖原密钥。最后一条命令不询问密码、成功退出，就可以使用一键启动器。首次连接时核对并接受宿主密钥。
+
+自动推导不可用，或使用了其他 SSH 主机别名时，可在发行版的 shell 配置中设置：
+
+```bash
+export RADIO_SSH=你的Termux用户名@localhost
+```
+
+自定义 SSH 端口使用 `--port`，例如 `distro-wsjt --port 8022`。每次需要一键连接时，确保 Termux 的 `sshd` 正在运行。
+
+---
+
+## 来源与致谢
+
+- **thingsapart**：[usbuart-termux](https://github.com/thingsapart/usbuart-termux)，本项目直接基于的 Termux 适配版本。
+- **Eugene Hutorny 及 USBUART 贡献者**：[hutorny/usbuart](https://github.com/hutorny/usbuart)，提供 USB 串口库及原有 C/C++/Java 接口。
+- **Linux 内核 CP210x 驱动作者与维护者**：[drivers/usb/serial/cp210x.c](https://github.com/torvalds/linux/blob/master/drivers/usb/serial/cp210x.c)，包括 Craig Shelley、Johan Hovold 等贡献者。本项目的 CP210x 用户态驱动参考其控制请求和串口配置实现，适配为 libusb 用户态访问。
+
+保留上游源码中的版权和许可声明，以及仓库原有的 `LICENSE`。第三方来源与许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。感谢以上项目让 Android 上的 USB 串口与电台应用成为可能。

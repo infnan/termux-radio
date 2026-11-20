@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <regex>
 #include "usbuart.hpp"
 
 static volatile sig_atomic_t stopping = 0;
@@ -169,7 +170,7 @@ struct port {
 		const std::string& directory, unsigned initial_baud) {
 		name = label;
 		driver.reset(usbuart::make_driver(handle, number));
-		const auto stops = label == "ft891-enhanced" ? usbuart::two : usbuart::one;
+		const auto stops = label.find("ft891") == 0 && label.find("-enhanced") != std::string::npos ? usbuart::two : usbuart::one;
 		usbuart::eia_tia_232_info settings{initial_baud, 8, usbuart::none, stops, usbuart::none_};
 		driver->setup(settings);
 		baud = initial_baud;
@@ -246,7 +247,7 @@ struct port {
 };
 
 int main(int argc, char** argv) {
-	std::string report_path, directory, selection = "auto";
+	std::string report_path, directory, selection = "auto", port_names;
 	bool probe = false, follow = true;
 	unsigned baud = 115200;
 	int descriptor = -1, enhanced = 0, standard = 1;
@@ -262,13 +263,14 @@ int main(int argc, char** argv) {
 			if (option == "--help") {
 				std::puts("termux-usb -r -e 'radio-bridge --link-dir DIR [options]' DEVICE\n"
 					"  --probe --report FILE     USB descriptors only, no serial commands\n"
-					"  --radio auto|ft891|g90    CP2105 dual UART / single FTDI UART\n"
+					"  --radio MODEL            explicit model label (default generic)\n"
+					"  --port-names NAMES       comma-separated names in interface order\n"
 					"  --baud N                 initial baud (USBUART_BAUD, default 115200)\n"
 					"  --baud-mode follow|fixed follow slave termios (default follow)\n"
 					"  --enhanced N --standard N override CP2105 interface numbers\n"
 					"  --report FILE            atomic JSON readiness report\n"
-					"FTDI/CP2105 identify a compatible adapter, not the radio model.\n"
-					"FT-891 Enhanced: 8N2; Standard/G90: 8N1; no flow control.\n"
+					"Model labels are supplied explicitly; USB-UART chips use generic names by default.\n"
+					"FT-891 Enhanced: 8N2; other ports: 8N1; no flow control.\n"
 					"RTS/DTR client ioctls are not forwarded. Use CAT PTT.");
 				return 0;
 			}
@@ -279,6 +281,7 @@ int main(int argc, char** argv) {
 				if (option == "--report") report_path = value;
 				else if (option == "--link-dir") directory = value;
 				else if (option == "--radio") selection = value;
+				else if (option == "--port-names") port_names = value;
 				else if (option == "--baud") baud = number(value);
 				else if (option == "--baud-mode") {
 					require(value == "follow" || value == "fixed", "Invalid baud mode");
@@ -298,7 +301,7 @@ int main(int argc, char** argv) {
 		}
 		require(descriptor >= 0, "USB descriptor missing; run via termux-usb -e");
 		speed(baud);
-		require(selection == "auto" || selection == "ft891" || selection == "g90", "Invalid radio selection");
+		require(std::regex_match(selection, std::regex("[a-z0-9-]+")), "Invalid model label");
 		device usb;
 		usb.open(descriptor);
 		libusb_device_descriptor description{};
@@ -308,16 +311,12 @@ int main(int argc, char** argv) {
 		unsigned char part = 0;
 		if (description.idVendor == 0x10c4)
 			libusb_control_transfer(usb.handle, 0xc0, 0xff, 0x370b, 0, &part, 1, 1000);
-		std::string model;
-		if (description.idVendor == 0x10c4 && description.idProduct == 0xea70 && part == 5 && available.size() == 2)
-			model = "ft891";
-		if (description.idVendor == 0x0403 &&
-			(description.idProduct == 0x6001 || description.idProduct == 0x6015) && available.size() == 1)
-			model = "g90";
+		std::string model = selection == "auto" ? "generic" : selection;
 		std::ostringstream metadata;
 		metadata << "\"pid\":" << getpid() << ",\"vid\":" << description.idVendor
 			<< ",\"product_id\":" << description.idProduct << ",\"part\":" << unsigned(part)
-			<< ",\"model\":" << json(model) << ",\"identity\":\"adapter-compatible\""
+			<< ",\"model\":" << json(model)
+			<< ",\"serial\":" << json(usb_string(usb.handle, description.iSerialNumber))
 			<< ",\"manufacturer\":" << json(usb_string(usb.handle, description.iManufacturer))
 			<< ",\"product\":" << json(usb_string(usb.handle, description.iProduct))
 			<< ",\"interfaces\":[";
@@ -327,8 +326,7 @@ int main(int argc, char** argv) {
 		}
 		metadata << ']';
 		if (probe) { report(report_path, "{" + metadata.str() + "}"); return 0; }
-		require(!model.empty(), "USB adapter is not a supported CP2105 dual UART / single FTDI UART");
-		require(selection == "auto" || selection == model, "Requested radio does not match USB adapter");
+		require(!available.empty(), "No serial bulk interfaces found");
 		require(!directory.empty() && directory.front() == '/', "--link-dir must be an absolute directory");
 		struct stat info{};
 		require(stat(directory.c_str(), &info) == 0 && S_ISDIR(info.st_mode), "Link directory missing");
@@ -343,11 +341,26 @@ int main(int argc, char** argv) {
 			ports.emplace_back(new port);
 			ports.back()->initialize(usb.handle, index, name, directory, baud);
 		};
-		if (model == "ft891") {
+		if (!port_names.empty()) {
+			std::istringstream names(port_names);
+			std::string name;
+			std::vector<std::string> used;
+			while (std::getline(names, name, ',')) {
+				require(std::regex_match(name, std::regex("[a-zA-Z0-9][a-zA-Z0-9-]*")) &&
+					std::find(used.begin(), used.end(), name) == used.end(), "Invalid or duplicate port name");
+				require(used.size() < available.size(), "Too many port names");
+				create(available[used.size()].number, name);
+				used.push_back(name);
+			}
+			require(used.size() == available.size(), "Port names must match interface count");
+		} else if (model == "ft891") {
 			require(enhanced != standard, "Enhanced and Standard interfaces must differ");
 			create(enhanced, "ft891-enhanced");
 			create(standard, "ft891-standard");
-		} else create(available.front().number, "g90");
+		} else {
+			for (std::size_t index = 0; index < available.size(); ++index)
+				create(available[index].number, "ttyUSB" + std::to_string(index));
+		}
 		std::ostringstream links;
 		for (std::size_t index = 0; index < ports.size(); ++index) {
 			if (index) links << ',';

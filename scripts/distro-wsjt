@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+
+
+MODELS = ("ft891", "ic7300", "g90", "g90s", "g90n", "x6100", "x6200", "ic705", "ftdx10", "ft710")
+PORT_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
+DEFAULT_LAUNCHERS = (Path("/usr/bin/wsjtx"), Path("/usr/bin/jtdx"))
+
+
+def termux_ssh_target():
+    configured = os.environ.get("RADIO_SSH")
+    if configured:
+        return configured
+    try:
+        status = Path("/proc/self/status").read_text()
+        uid = int(re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE).group(1))
+    except (OSError, ValueError, AttributeError):
+        return None
+    profile, application = divmod(uid, 100000)
+    if 10000 <= application < 20000:
+        return f"u{profile}_a{application - 10000}@localhost"
+    return None
+
+
+def resolve_launcher(custom):
+    candidates = (Path(custom).expanduser().resolve(),) if custom else DEFAULT_LAUNCHERS
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    if custom:
+        raise RuntimeError(f"自定义启动器不存在或不可执行：{candidates[0]}")
+    raise RuntimeError("未找到 /usr/bin/wsjtx 或 /usr/bin/jtdx；请安装 WSJT-X/JTDX，或用 --launcher 指定自定义启动器。")
+
+
+def dialog(message, error=False):
+    print(message, file=sys.stderr, flush=True)
+    graphical = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if graphical and shutil.which("zenity"):
+        subprocess.run(["zenity", "--error" if error else "--info", "--title=WSJT-X / JTDX 电台 USB", "--text=" + message])
+    elif graphical and shutil.which("kdialog"):
+        subprocess.run(["kdialog", "--error" if error else "--msgbox", message, "--title", "WSJT-X / JTDX 电台 USB"])
+    elif graphical and shutil.which("xmessage"):
+        subprocess.run(["xmessage", "-center", "-buttons", "确定:0", message])
+
+
+def choose_connection_action(message):
+    print(message, file=sys.stderr, flush=True)
+    graphical = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if graphical and shutil.which("zenity"):
+        result = subprocess.run(["zenity", "--question", "--title=WSJT-X / JTDX 电台 USB",
+                                 "--text=" + message, "--ok-label=重试", "--cancel-label=中止",
+                                 "--extra-button=忽略"], text=True, capture_output=True)
+        if result.stdout.strip() == "忽略" and result.returncode in (0, 1):
+            return "ignore"
+        return "retry" if result.returncode == 0 else "abort"
+    if graphical and shutil.which("kdialog"):
+        result = subprocess.run(["kdialog", "--yesnocancel", message, "--title", "WSJT-X / JTDX 电台 USB",
+                                 "--yes-label", "重试", "--no-label", "忽略", "--cancel-label", "中止"])
+        return {0: "retry", 1: "ignore"}.get(result.returncode, "abort")
+    if graphical and shutil.which("xmessage"):
+        result = subprocess.run(["xmessage", "-center", "-buttons", "重试:10,中止:11,忽略:12", message])
+        return {10: "retry", 12: "ignore"}.get(result.returncode, "abort")
+    while True:
+        try:
+            answer = input("请选择：重试(r) / 中止(a) / 忽略(i)：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "abort"
+        if answer in ("r", "重试"):
+            return "retry"
+        if answer in ("a", "中止"):
+            return "abort"
+        if answer in ("i", "忽略"):
+            return "ignore"
+
+
+def detect_radio(args):
+    try:
+        if not shutil.which("ssh"):
+            raise RuntimeError("缺少 ssh：请在发行版内安装 OpenSSH 客户端")
+        value = remote(args, "status")
+        devices = connected(value, args.radio, args.device)
+        if devices:
+            return devices, ""
+        if value.get("ready") and not any(
+                args.radio in ("auto", item.get("model")) and
+                (not args.device or args.device in item.get("ports", {}))
+                for item in value.get("devices", [])):
+            return [], "宿主已有其他串口，但没有找到所选设备；请检查 --device / --radio。"
+        if value.get("ready"):
+            return [], ("Termux 桥接已就绪，但发行版无法访问所需 PTY。请确保使用同一个 Android UID，"
+                        "且 proot 绑定了宿主 /dev/pts（启动参数 -b /dev/pts:/dev/pts）。"
+                        "请退出后重新进入发行版；使用 proot-distro 时先检查其 /dev/pts 是否可见。")
+        return [], "没有检测到就绪的电台。" + value.get("error", "")
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        return [], str(error)
+
+
+def remote(args, action):
+    if not args.ssh:
+        raise RuntimeError("请用 --ssh 用户名@localhost 或 RADIO_SSH 配置 Termux SSH；用户名在 Termux 中执行 whoami 查看。参见 README 的 SSH 配置附录。")
+    command = shlex.join([args.remote_command, action, "--json"] +
+                         (["--baud", str(args.baud), "--wait", str(args.wait), "--radio", args.radio] if action == "start" else []))
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                             "-p", str(args.port), args.ssh, command],
+                            text=True, capture_output=True, timeout=args.wait + 30 if action == "start" else 15)
+    try:
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("状态不是 JSON 对象")
+        return value
+    except ValueError as error:
+        raise RuntimeError(f"Termux {action} 失败：{result.stderr.strip() or result.stdout.strip() or result.returncode}") from error
+
+
+def usable(path):
+    if not isinstance(path, str) or not path.startswith("/dev/pts/") or not path[9:].isdigit():
+        return False
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        return stat.S_ISCHR(os.fstat(descriptor).st_mode) and os.isatty(descriptor)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def connected(value, requested, selected=None):
+    if not value.get("running"):
+        return []
+    valid = []
+    for device in value.get("devices", []):
+        model = device.get("model")
+        if requested not in ("auto", model):
+            continue
+        ports = device.get("ports", {})
+        if selected and selected not in ports:
+            continue
+        if ports and all(PORT_NAME.fullmatch(name) and usable(target) for name, target in ports.items()):
+            valid.append(device)
+    return valid
+
+
+def publish(directory, devices):
+    directory.mkdir(parents=True, exist_ok=True)
+    current = {name: target for device in devices for name, target in device["ports"].items()
+               if PORT_NAME.fullmatch(name)}
+    manifest = directory / ".managed-ports.json"
+    try:
+        previous = json.loads(manifest.read_text())
+        if not isinstance(previous, list):
+            previous = []
+    except (OSError, ValueError):
+        previous = []
+    for name in set(current) | {name for name in previous if isinstance(name, str) and PORT_NAME.fullmatch(name)}:
+        link = directory / name
+        if name not in current:
+            if link.is_symlink():
+                link.unlink()
+            continue
+        temporary = directory / f".{name}.{os.getpid()}"
+        if link.exists() and not link.is_symlink():
+            raise RuntimeError(f"串口路径已被普通文件占用：{link}")
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(current[name])
+        temporary.replace(link)
+    temporary = directory / f".managed-ports.{os.getpid()}"
+    temporary.write_text(json.dumps(sorted(current)))
+    temporary.replace(manifest)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="在 proot 发行版内连接 Termux USB 串口，可选启动 WSJT-X/JTDX。")
+    parser.add_argument("--ssh", default=termux_ssh_target(), help="Termux SSH 目标；默认使用 RADIO_SSH 或从 Android UID 自动推导")
+    parser.add_argument("--port", type=int, default=8022)
+    parser.add_argument("--remote-command", default="/data/data/com.termux/files/usr/bin/termux-usb-serial")
+    parser.add_argument("--radio", choices=("auto", *MODELS), default="auto")
+    parser.add_argument("--device", help="只使用指定串口所在设备，例如 ttyUSB0 或 ft891-enhanced")
+    parser.add_argument("--baud", type=int, default=os.environ.get("RADIO_BAUD", "4800"))
+    parser.add_argument("--wait", type=int, default=60)
+    parser.add_argument("--link-dir", type=Path, default=Path(os.environ.get("RADIO_DISTRO_LINK_DIR", os.environ.get("RADIO_ARCH_LINK_DIR", str(Path.home() / ".local/run/termux-serial")))))
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--connect-only", action="store_true", help="只连接串口，不启动 WSJT-X/JTDX")
+    parser.add_argument("--launcher", metavar="PATH", help="自定义可执行程序或启动脚本；默认依次查找 /usr/bin/wsjtx、/usr/bin/jtdx")
+    args, program_arguments = parser.parse_known_args()
+    if program_arguments[:1] == ["--"]:
+        program_arguments = program_arguments[1:]
+    launcher = None if args.check_only or args.connect_only else resolve_launcher(args.launcher)
+    retry_error = ""
+    while True:
+        devices, detail = detect_radio(args)
+        if devices:
+            break
+        if args.check_only:
+            raise RuntimeError(detail)
+        message = ("未检测到可访问的串口设备。\n" + detail +
+                   ("\n上次重试失败：" + retry_error if retry_error else "") +
+                   "\n请插好 USB 线、解锁手机，并允许 Termux:API 的 USB 访问请求。\n"
+                   "重试：重新检查 TTY，必要时请求 Termux 获取 USB 后再检测。\n"
+                   "中止：结束程序。" + ("忽略：直接返回。" if args.connect_only else "忽略：不连接设备，直接启动软件。"))
+        action = choose_connection_action(message)
+        if action == "abort":
+            return 1
+        if action == "ignore":
+            if args.connect_only:
+                return 0
+            os.execv(launcher, [launcher, *program_arguments])
+            return 0
+        retry_error = ""
+        devices, detail = detect_radio(args)
+        if not devices:
+            try:
+                remote(args, "start")
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                retry_error = str(error)
+    publish(args.link_dir, devices)
+    print("串口就绪：" + ", ".join(str(args.link_dir / name) for device in devices for name in device["ports"]), flush=True)
+    if args.check_only or args.connect_only:
+        return 0
+    os.execv(launcher, [launcher, *program_arguments])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        dialog(str(error), error=True)
+        sys.exit(1)
