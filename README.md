@@ -17,6 +17,8 @@
 - 已有可以运行图形软件的 proot Linux 环境，并安装 WSJT-X 或 JTDX。
 - 通联前准备好音频输入输出和系统时间。本项目负责 USB 串口连接。
 
+如果还没有配置声音，可参考文末的“声音配置参考”附录。
+
 项目包含 CP210x、FTDI、CH34x 和 PL2303 串口驱动。下面的流程优先以 FT-891 为例，串口参数请与自己的电台一致。
 
 ## 1. 在 Termux 宿主安装
@@ -200,7 +202,90 @@ tail -n 80 ~/.local/state/termux-radio/service.log
 
 已经运行的宿主服务保留原参数。执行 `termux-usb-serial stop`，再用新参数 `start`。
 
-## 附录：配置发行版调用 Termux 的 SSH
+## 附录1：声音配置参考
+
+**以下仅为参考配置。** 这是一种让发行版内的 WSJT-X / JTDX 使用 Termux PulseAudio 服务的配置方式，请结合自己的 Android 音频连接和发行版环境调整。
+
+### 1. 在 Termux 宿主启动 PulseAudio
+
+以下命令在 **Termux 宿主**执行。如果尚未安装 PulseAudio，先安装：
+
+```bash
+# 安装
+pkg install pulseaudio
+# 启动
+pulseaudio --start --exit-idle-time=-1 --use-pid-file=no
+pactl load-module module-sles-source
+```
+
+使用软件期间保持宿主 PulseAudio 服务运行。
+
+### 2. 在发行版内连接宿主音频服务
+
+以下命令在 **发行版内**执行，Debian、Ubuntu、Arch 等均按这一流程操作。先查找宿主的 PulseAudio socket：
+
+```bash
+export PULSE_SOCKET="$(find /data/data/com.termux/files/usr/tmp -maxdepth 2 \
+    -type s -name native -print -quit 2>/dev/null)"
+
+if [ -n "$PULSE_SOCKET" ]; then
+    export PULSE_SERVER="unix:$PULSE_SOCKET"
+    printf '使用 PulseAudio 服务：%s\n' "$PULSE_SERVER"
+else
+    printf '%s\n' '未找到宿主 PulseAudio socket，请先检查宿主服务及路径是否可见。' >&2
+fi
+```
+
+看到 `使用 PulseAudio 服务：unix:...` 后，再继续后面的步骤。如果未找到 socket，先确认 Termux 中已启动 PulseAudio，并且发行版可以访问 `/data/data/com.termux/files/usr/tmp`；自行配置 proot 的用户可将宿主该目录绑定到发行版内的相同路径。
+
+### 3. 配置发行版的 PulseAudio 和 ALSA 客户端
+
+仍在 **发行版内**执行。下面的命令仅在文件不存在时创建配置，**不会覆盖已有配置**：
+
+```bash
+if [ ! -f "$HOME/.config/pulse/client.conf" ]; then
+    mkdir -p "$HOME/.config/pulse"
+    cat > "$HOME/.config/pulse/client.conf" <<'EOF'
+enable-shm = no
+enable-memfd = no
+EOF
+fi
+
+if [ ! -f "$HOME/.asoundrc" ]; then
+    cat > "$HOME/.asoundrc" <<'EOF'
+pcm.!default {
+    type pulse
+}
+
+ctl.!default {
+    type pulse
+}
+EOF
+fi
+```
+
+如果这些文件已经存在，请先备份，再按需要将上述配置合并进去。发行版需已安装相应的 PulseAudio 客户端组件和 ALSA PulseAudio 插件。
+
+### 4. 在 WSJT-X / JTDX 中选择声音设备
+
+在完成第 2 步的**同一个发行版终端**中启动软件，例如：
+
+```bash
+/usr/bin/wsjtx
+# 或
+/usr/bin/jtdx
+```
+
+也可从该终端运行前文的 `distro-wsjt` 或自定义启动器。打开 **Settings → Audio**：
+
+- **Input**：`OpenSL_ES_source`
+- **Output**：`OpenSL_ES_sink`
+
+**注意：Android 不要处于静音模式，并检查媒体音量。** 电台与手机之间的音频连接也应按自己的设备接好。
+
+重新打开终端，或宿主 PulseAudio 重启后，重新执行第 2 步，再启动软件。如果从桌面图标启动，也要让启动器获得相同的 `PULSE_SERVER` 环境变量。
+
+## 附录2：配置发行版调用 Termux 的 SSH
 
 **已有免密连接就跳过本节。** `distro-wsjt` 会从当前 Android UID 自动推导 Termux 用户名，默认连接 `localhost:8022`；也可用 `--ssh` 或 `RADIO_SSH` 显式指定。账号不是固定的，每台设备以 Termux 中 `whoami` 的输出为准。
 
